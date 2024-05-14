@@ -6,6 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::io::{BufRead, BufReader, Write};
+use std::collections::HashSet;
 
 fn main() {
     let application = Application::new(
@@ -23,11 +24,29 @@ fn main() {
         let list_box = ListBox::new();
         let path = Path::new("/usr/bin");
         let recent_apps_file = Path::new("app_cache.txt");
+        let all_apps_file = Path::new("all_apps.txt");
 
         // Check if the file exists, if not create it
         if !recent_apps_file.exists() {
             fs::File::create(&recent_apps_file).expect("Could not create file");
         }
+
+        // Check if the file exists, if not create it and write all apps to it
+        if !all_apps_file.exists() {
+            let entries = fs::read_dir(path).unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.metadata().ok().map_or(false, |m| m.permissions().mode() & 0o111 != 0))
+                .map(|e| e.file_name().into_string().unwrap_or_default())
+                .collect::<Vec<_>>();
+            fs::write(&all_apps_file, entries.join("\n")).unwrap();
+        }
+
+        // Load all apps
+        let all_apps = fs::read_to_string(&all_apps_file)
+            .unwrap()
+            .lines()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
 
         // Load recently used apps
         let file = fs::File::open(&recent_apps_file).unwrap();
@@ -48,16 +67,13 @@ fn main() {
                 list_box_clone.remove(child);
             });
 
-            let entries = fs::read_dir(path).unwrap()
-                .filter_map(Result::ok)
-                .filter(|e| e.metadata().ok().map_or(false, |m| m.permissions().mode() & 0o111 != 0))
-                .map(|e| e.file_name().into_string().unwrap_or_default())
+            let entries = all_apps.iter()
                 .filter(|app_name| app_name.contains(&input))
                 .collect::<Vec<_>>();
 
             for app_name in entries {
                 let row = ListBoxRow::new();
-                let label = Label::new(Some(&app_name));
+                let label = Label::new(Some(app_name));
                 row.add(&label);
                 list_box_clone.add(&row);
             }
@@ -73,9 +89,9 @@ fn main() {
                 .unwrap()
                 .lines()
                 .map(|line| line.to_string())
-                .collect::<Vec<_>>();
-            recent_apps.insert(0, app_name.clone());
-            fs::write(&recent_apps_file, recent_apps.join("\n")).unwrap();
+                .collect::<HashSet<_>>();
+            recent_apps.insert(app_name.clone());
+            fs::write(&recent_apps_file, recent_apps.into_iter().collect::<Vec<_>>().join("\n")).unwrap();
 
             let output = Command::new(&app_name)
                 .output()
