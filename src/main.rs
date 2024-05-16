@@ -1,15 +1,16 @@
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::time::SystemTime;
+use chrono::prelude::*;
 use gio::prelude::*;
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow, Entry, ListBox, ListBoxRow, Label, Separator, LabelBuilder, Button, Box, Orientation};
+use once_cell::sync::Lazy;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
-use std::collections::{HashSet, HashMap};
-use std::time::SystemTime;
-use chrono::prelude::*;
-use std::rc::Rc;
-use once_cell::sync::Lazy;
-use std::path::PathBuf;
+use std::collections::HashMap;
 use lazy_static::lazy_static;
 
 lazy_static! {
@@ -17,15 +18,15 @@ lazy_static! {
     static ref APPS_FILE: PathBuf = PathBuf::from("apps.txt");
 }
 
-static ALL_APPS: Lazy<HashMap<char, HashSet<String>>> = Lazy::new(|| {
+static ALL_APPS: Lazy<HashMap<char, Vec<String>>> = Lazy::new(|| {
     let mut map = HashMap::new();
-    for entry in fs::read_dir(&*PATH).unwrap() {
+    for entry in fs::read_dir(&*PATH).unwrap_or_else(|_| panic!("Failed to read directory")) {
         if let Ok(entry) = entry {
             if let Ok(metadata) = entry.metadata() {
                 if metadata.permissions().mode() & 0o111 != 0 {
-                    if let Ok(name) = entry.file_name().into_string() {
-                        let first_char = name.chars().next().unwrap().to_ascii_lowercase();
-                        map.entry(first_char).or_insert_with(HashSet::new).insert(name);
+                    if let Some(name) = entry.file_name().to_str() {
+                        let first_char = name.chars().next().unwrap_or_default().to_ascii_lowercase();
+                        map.entry(first_char).or_insert_with(Vec::new).push(name.to_string());
                     }
                 }
             }
@@ -44,6 +45,36 @@ static RECENT_APPS: Lazy<HashSet<String>> = Lazy::new(|| {
         .unwrap_or_default()
 });
 
+fn create_row(app_name: &str) -> ListBoxRow {
+    let row = ListBoxRow::new();
+    let label = Label::new(Some(app_name));
+    row.add(&label);
+    row
+}
+
+fn launch_app(app_name: &str) {
+    // Update recently used apps
+    let mut recent_apps = fs::read_to_string(&*APPS_FILE)
+        .unwrap_or_default()
+        .split("---\n")
+        .nth(1)
+        .unwrap_or("")
+        .lines()
+        .map(|line| line.to_string())
+        .collect::<HashSet<_>>();
+    recent_apps.insert(app_name.to_string());
+    fs::write(&*APPS_FILE, ALL_APPS.values().flatten().cloned().collect::<Vec<_>>().join("\n") + "\n---\n" + &recent_apps.into_iter().collect::<Vec<_>>().join("\n")).unwrap();
+
+    let output = Command::new(app_name)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .expect("Failed to execute command");
+
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+    std::process::exit(0); // Add this line to close the application after launching another application
+}
+
 fn main() {
     let application = Application::new(
         Some("com.example.GtkApplication"),
@@ -59,60 +90,47 @@ fn main() {
         let list_box = Rc::new(ListBox::new());
 
         for app_name in RECENT_APPS.iter() {
-            let row = ListBoxRow::new();
-            let label = Label::new(Some(app_name));
-            row.add(&label);
-            list_box.add(&row);
+            list_box.add(&create_row(app_name));
         }
         list_box.show_all();
 
         entry.connect_changed(glib::clone!(@strong list_box => move |entry| {
-            let input = entry.get_text().as_str().to_string();
+            let input = entry.get_text().as_str().to_lowercase();
             list_box.foreach(|child| {
                 list_box.remove(child);
             });
 
-            if let Some(first_char) = input.chars().next() {
-                if let Some(apps) = ALL_APPS.get(&first_char.to_ascii_lowercase()) {
-                    let entries = apps.iter()
-                        .filter(|app_name| app_name.contains(&input))
-                        .collect::<Vec<_>>();
+            let mut entries = ALL_APPS.values()
+                .flatten()
+                .filter(|app_name| app_name.to_lowercase().contains(&input))
+                .cloned()
+                .collect::<Vec<_>>();
 
-                    for app_name in entries {
-                        let row = ListBoxRow::new();
-                        let label = Label::new(Some(app_name));
-                        row.add(&label);
-                        list_box.add(&row);
-                    }
-                }
+            // Limit the number of results to 9
+            entries.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+            entries.truncate(9);
+
+            for app_name in entries {
+                list_box.add(&create_row(&app_name));
             }
+
             list_box.show_all();
         }));
 
-        list_box.connect_row_activated(move |_list_box, row| {
-            let label = row.get_child().unwrap().downcast::<Label>().unwrap();
-            let app_name = label.get_text().as_str().to_string();
+        entry.connect_activate(glib::clone!(@strong list_box => move |_entry| {
+            if let Some(row) = list_box.get_row_at_index(0) {
+                if let Some(label) = row.get_child().and_then(|child| child.downcast::<Label>().ok()) {
+                    let app_name = label.get_text().as_str().to_string();
+                    launch_app(&app_name);
+                }
+            }
+        }));
 
-            // Update recently used apps
-            let mut recent_apps = fs::read_to_string(&*APPS_FILE)
-                .unwrap_or_default()
-                .split("---\n")
-                .nth(1)
-                .unwrap_or("")
-                .lines()
-                .map(|line| line.to_string())
-                .collect::<HashSet<_>>();
-            recent_apps.insert(app_name.clone());
-            fs::write(&*APPS_FILE, ALL_APPS.values().flatten().cloned().collect::<Vec<_>>().join("\n") + "\n---\n" + &recent_apps.into_iter().collect::<Vec<_>>().join("\n")).unwrap();
-
-            let output = Command::new(&app_name)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .output()
-                .expect("Failed to execute command");
-
-            println!("{}", String::from_utf8_lossy(&output.stdout));
-            std::process::exit(0); // Add this line to close the application after launching another application
+        list_box.connect_row_activated(move |list_box, row| {
+            if let Some(label) = row.get_child().and_then(|child| child.downcast::<Label>().ok()) {
+                let app_name = label.get_text().as_str().to_string();
+                launch_app(&app_name);
+            }
         });
 
         vbox.pack_start(&entry, false, false, 0);
