@@ -1,5 +1,5 @@
 [package]
-name = "waylaunch"
+name = "RustRocket"
 version = "0.1.0"
 edition = "2018"
 
@@ -13,4 +13,8 @@ lazy_static = "1.4.0"
 once_cell = "1.8.0"
 glib = "0.10.3"
 rayon = "1.5.3"
-
+notify = "5.0.0-pre.2"
+dirs = "3.0"
+tokio = { version = "*", features = ["full"] }
+futures = "0.3.18"
+parking_lot = "0.11"
