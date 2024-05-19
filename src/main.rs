@@ -118,7 +118,7 @@ fn main() {
     application.connect_activate(|app| {
         let window = ApplicationWindow::new(app);
         window.set_title("Application Launcher");
-        window.set_default_size(200, 300); // Set the default size of the window
+        window.set_default_size(300, 200); // Set the default size of the window
 
         let vbox = GtkBox::new(Orientation::Vertical, 1);
 
