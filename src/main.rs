@@ -1,16 +1,14 @@
-use std::{fs, process::{Command, Stdio}, sync::RwLock, time::SystemTime};
+use std::{fs, process::Command, sync::Mutex, time::SystemTime};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use xdg::BaseDirectories;
 use chrono::prelude::*;
-use gio::prelude::*;
-use gtk::prelude::*;
-use gtk::{Application, ApplicationWindow, Entry, ListBox, ListBoxRow, Label, Separator, Button, Box as GtkBox, Orientation, ScrolledWindow};
 use once_cell::sync::Lazy;
 use serde::{Serialize, Deserialize};
 use bincode::{serialize, deserialize};
-use glib::clone;
 use dirs;
+use eframe::egui;
+use eframe::egui::{CentralPanel, Context, ScrollArea, TextEdit, CursorIcon};
 
 static RECENT_APPS_FILE: Lazy<PathBuf> = Lazy::new(|| PathBuf::from("recent_apps.bin"));
 
@@ -23,12 +21,12 @@ fn save_cache<T: Serialize>(file: &PathBuf, cache: &T) -> Result<(), Box<dyn std
     Ok(())
 }
 
-static RECENT_APPS_CACHE: Lazy<RwLock<RecentAppsCache>> = Lazy::new(|| {
+static RECENT_APPS_CACHE: Lazy<Mutex<RecentAppsCache>> = Lazy::new(|| {
     let recent_apps = if RECENT_APPS_FILE.exists() {
         let data = fs::read(&*RECENT_APPS_FILE).expect("Failed to read recent apps file");
         deserialize(&data).expect("Failed to deserialize recent apps data")
     } else { VecDeque::new() };
-    RwLock::new(RecentAppsCache { recent_apps })
+    Mutex::new(RecentAppsCache { recent_apps })
 });
 
 fn get_desktop_entries() -> Vec<String> {
@@ -68,7 +66,6 @@ fn parse_desktop_entry(path: &str) -> Option<(String, String)> {
         }
     }
     if let (Some(name), Some(exec)) = (name, exec) {
-        // Clean up the Exec command
         let cleaned_exec = exec.replace("%f", "")
                                .replace("%u", "")
                                .replace("%U", "")
@@ -92,16 +89,8 @@ fn search_applications(query: &str, applications: &[(String, String)]) -> Vec<(S
         .collect()
 }
 
-fn create_row(app_name: &str) -> ListBoxRow {
-    let row = ListBoxRow::new();
-    let label = Label::new(Some(app_name));
-    label.set_halign(gtk::Align::Start);
-    row.add(&label);
-    row
-}
-
-fn launch_app(app_name: &str, exec_cmd: &str, window: &ApplicationWindow) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cache = RECENT_APPS_CACHE.write().map_err(|e| format!("Lock error: {:?}", e))?;
+fn launch_app(app_name: &str, exec_cmd: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cache = RECENT_APPS_CACHE.lock().map_err(|e| format!("Lock error: {:?}", e))?;
     cache.recent_apps.retain(|x| x != app_name);
     cache.recent_apps.push_front(app_name.to_string());
     if cache.recent_apps.len() > 10 { cache.recent_apps.pop_back(); }
@@ -112,113 +101,110 @@ fn launch_app(app_name: &str, exec_cmd: &str, window: &ApplicationWindow) -> Res
         .arg("-c")
         .arg(exec_cmd)
         .current_dir(home_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .spawn()?;
-    window.close();
     Ok(())
 }
 
-fn handle_activate(_entry: &Entry, list_box: &ListBox, window: &ApplicationWindow, applications: &[(String, String)]) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(row) = list_box.get_row_at_index(0) {
-        if let Some(label) = row.get_child().and_then(|child| child.downcast::<Label>().ok()) {
-            let app_name = label.get_text().to_string();
-            if let Some((_, exec_cmd)) = applications.iter().find(|(name, _)| name == &app_name) {
-                launch_app(&app_name, exec_cmd, window)?;
-            }
+struct AppLauncher {
+    query: String,
+    applications: Vec<(String, String)>,
+    search_results: Vec<(String, String)>,
+    is_quit: bool,
+}
+
+impl Default for AppLauncher {
+    fn default() -> Self {
+        let applications: Vec<(String, String)> = get_desktop_entries()
+            .iter()
+            .filter_map(|path| parse_desktop_entry(path))
+            .collect();
+
+        let recent_apps_cache = RECENT_APPS_CACHE.lock().expect("Failed to acquire read lock");
+
+        Self {
+            query: String::new(),
+            search_results: recent_apps_cache.recent_apps.iter().filter_map(|app_name| {
+                applications.iter().find(|(name, _)| name == app_name).cloned()
+            }).collect(),
+            applications,
+            is_quit: false,
         }
     }
-    Ok(())
 }
 
-fn main() {
-    let applications: Vec<(String, String)> = get_desktop_entries()
-        .iter()
-        .filter_map(|path| parse_desktop_entry(path))
-        .collect();
-
-    let application = Application::new(Some("com.example.GtkApplication"), Default::default()).expect("Failed to initialize GTK application");
-
-    application.connect_activate(move |app| {
-        let window = ApplicationWindow::new(app);
-        window.set_title("Application Launcher");
-        window.set_default_size(300, 200);
-
-        let vbox = GtkBox::new(Orientation::Vertical, 1);
-        let entry = Entry::new();
-        let scrolled_window = ScrolledWindow::new(gtk::NONE_ADJUSTMENT, gtk::NONE_ADJUSTMENT);
-        let list_box = ListBox::new();
-
-        for app_name in &RECENT_APPS_CACHE.read().expect("Failed to acquire read lock").recent_apps {
-            list_box.add(&create_row(app_name));
+impl eframe::App for AppLauncher {
+    fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        ctx.request_repaint();  // Ensure the app continues to repaint while it's running
+        
+        if self.is_quit {
+            std::process::exit(0);  // Exit the process if is_quit is true
         }
-        list_box.show_all();
 
-        entry.connect_changed(clone!(@strong list_box, @strong applications => move |entry| {
-            let input = entry.get_text().to_lowercase();
-            list_box.foreach(|child| list_box.remove(child));
-
-            let mut entries: Vec<_> = search_applications(&input, &applications);
-            entries.sort();
-            entries.truncate(9);
-
-            for (app_name, _) in entries {
-                list_box.add(&create_row(&app_name));
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::Escape) {
+                self.is_quit = true;
             }
-
-            list_box.show_all();
-        }));
-
-        let entry_clone = entry.clone();
-        entry.connect_activate(clone!(@strong list_box, @strong window, @strong applications => move |_entry| {
-            if let Err(err) = handle_activate(&entry_clone, &list_box, &window, &applications) {
-                eprintln!("Failed to handle activate: {}", err);
-            }
-        }));
-
-        list_box.connect_row_activated(clone!(@strong window, @strong applications => move |_list_box, row| {
-            if let Some(label) = row.get_child().and_then(|child| child.downcast::<Label>().ok()) {
-                let app_name = label.get_text().to_string();
-                if let Some((_, exec_cmd)) = applications.iter().find(|(name, _)| name == &app_name) {
-                    if let Err(err) = launch_app(&app_name, exec_cmd, &window) {
+            if i.key_pressed(egui::Key::Enter) {
+                if let Some((app_name, exec_cmd)) = self.search_results.first() {
+                    if let Err(err) = launch_app(app_name, exec_cmd) {
                         eprintln!("Failed to launch app: {}", err);
+                    } else {
+                        self.is_quit = true;
                     }
                 }
             }
-        }));
+        });
 
-        scrolled_window.add(&list_box);
-        vbox.pack_start(&entry, false, false, 0);
-        vbox.pack_start(&scrolled_window, true, true, 0);
+        CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Application Launcher");
+            if ui.add(TextEdit::singleline(&mut self.query).hint_text("Search...")).changed() {
+                self.search_results = search_applications(&self.query, &self.applications);
+            }
 
-        let separator = Separator::new(Orientation::Horizontal);
-        vbox.pack_start(&separator, false, false, 0);
+            ScrollArea::vertical().show(ui, |ui| {
+                for (app_name, exec_cmd) in &self.search_results {
+                    if ui.button(app_name).clicked() {
+                        if let Err(err) = launch_app(app_name, exec_cmd) {
+                            eprintln!("Failed to launch app: {}", err);
+                        } else {
+                            self.is_quit = true;
+                        }
+                    }
+                }
+            });
 
-        let datetime: DateTime<Local> = SystemTime::now().into();
-        let label = Label::new(Some(&datetime.format("%I:%M %p %m/%d/%Y").to_string()));
-        label.set_halign(gtk::Align::Start);
-        vbox.pack_start(&label, false, false, 0);
+            ui.separator();
+            
+            let datetime: DateTime<Local> = SystemTime::now().into();
+            ui.label(datetime.format("%I:%M %p %m/%d/%Y").to_string());
 
-        let hbox = GtkBox::new(Orientation::Horizontal, 0);
+            ui.horizontal(|ui| {
+                if ui.button("Power").clicked() {
+                    Command::new("shutdown").arg("-h").arg("now").spawn().expect("Failed to execute shutdown command");
+                }
+                if ui.button("Restart").clicked() {
+                    Command::new("reboot").spawn().expect("Failed to execute reboot command");
+                }
+                if ui.button("Logout").clicked() {
+                    Command::new("logout").spawn().expect("Failed to execute logout command");
+                }
+            });
+        });
 
-        let power_button = Button::with_label("Power");
-        power_button.connect_clicked(|_| { Command::new("shutdown").arg("-h").arg("now").spawn().expect("Failed to execute shutdown command"); });
-        hbox.pack_start(&power_button, false, false, 0);
+        // Ensure the cursor is set correctly on every frame
+        ctx.output_mut(|o| o.cursor_icon = CursorIcon::Default);
+    }
+}
 
-        let restart_button = Button::with_label("Restart");
-        restart_button.connect_clicked(|_| { Command::new("reboot").spawn().expect("Failed to execute reboot command"); });
-        hbox.pack_start(&restart_button, false, false, 0);
-
-        let logout_button = Button::with_label("Logout");
-        logout_button.connect_clicked(|_| { Command::new("logout").spawn().expect("Failed to execute logout command"); });
-        hbox.pack_start(&logout_button, false, false, 0);
-
-        vbox.pack_start(&hbox, false, false, 0);
-
-        window.add(&vbox);
-        window.show_all();
-    });
-
-    application.run(&[]);
+fn main() -> eframe::Result<()> {
+    let native_options = eframe::NativeOptions {
+        // Removed window size options
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Application Launcher",
+        native_options,
+        Box::new(|_cc| Box::new(AppLauncher::default())),
+    )
 }
 
