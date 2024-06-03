@@ -8,12 +8,15 @@ use serde::{Serialize, Deserialize};
 use bincode::{serialize, deserialize};
 use dirs;
 use eframe::egui;
-use eframe::egui::{CentralPanel, Context, ScrollArea, TextEdit, CursorIcon};
+use eframe::egui::{CentralPanel, Context, ScrollArea, TextEdit, CursorIcon, Layout, Align};
+use rayon::prelude::*;
 
 static RECENT_APPS_FILE: Lazy<PathBuf> = Lazy::new(|| PathBuf::from("recent_apps.bin"));
 
 #[derive(Serialize, Deserialize)]
-struct RecentAppsCache { recent_apps: VecDeque<String> }
+struct RecentAppsCache {
+    recent_apps: VecDeque<String>,
+}
 
 fn save_cache<T: Serialize>(file: &PathBuf, cache: &T) -> Result<(), Box<dyn std::error::Error>> {
     let data = serialize(cache)?;
@@ -25,7 +28,9 @@ static RECENT_APPS_CACHE: Lazy<Mutex<RecentAppsCache>> = Lazy::new(|| {
     let recent_apps = if RECENT_APPS_FILE.exists() {
         let data = fs::read(&*RECENT_APPS_FILE).expect("Failed to read recent apps file");
         deserialize(&data).expect("Failed to deserialize recent apps data")
-    } else { VecDeque::new() };
+    } else {
+        VecDeque::new()
+    };
     Mutex::new(RecentAppsCache { recent_apps })
 });
 
@@ -33,22 +38,25 @@ fn get_desktop_entries() -> Vec<String> {
     let xdg_dirs = BaseDirectories::new().unwrap();
     let data_dirs = xdg_dirs.get_data_dirs();
 
-    let mut entries = Vec::new();
-    for dir in data_dirs {
-        let desktop_files = dir.join("applications");
-        if let Ok(entries_iter) = fs::read_dir(desktop_files) {
-            for entry in entries_iter {
-                if let Ok(entry) = entry {
-                    if let Some(path) = entry.path().to_str() {
-                        if path.ends_with(".desktop") {
-                            entries.push(path.to_string());
+    data_dirs.par_iter()
+        .flat_map(|dir| {
+            let desktop_files = dir.join("applications");
+            if let Ok(entries) = fs::read_dir(desktop_files) {
+                entries.filter_map(Result::ok)
+                    .filter_map(|entry| {
+                        let path = entry.path();
+                        if path.extension()? == "desktop" {
+                            Some(path.to_string_lossy().to_string())
+                        } else {
+                            None
                         }
-                    }
-                }
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
             }
-        }
-    }
-    entries
+        })
+        .collect()
 }
 
 fn parse_desktop_entry(path: &str) -> Option<(String, String)> {
@@ -67,14 +75,14 @@ fn parse_desktop_entry(path: &str) -> Option<(String, String)> {
     }
     if let (Some(name), Some(exec)) = (name, exec) {
         let cleaned_exec = exec.replace("%f", "")
-                               .replace("%u", "")
-                               .replace("%U", "")
-                               .replace("%F", "")
-                               .replace("%i", "")
-                               .replace("%c", "")
-                               .replace("%k", "")
-                               .trim()
-                               .to_string();
+            .replace("%u", "")
+            .replace("%U", "")
+            .replace("%F", "")
+            .replace("%i", "")
+            .replace("%c", "")
+            .replace("%k", "")
+            .trim()
+            .to_string();
         Some((name, cleaned_exec))
     } else {
         None
@@ -82,9 +90,9 @@ fn parse_desktop_entry(path: &str) -> Option<(String, String)> {
 }
 
 fn search_applications(query: &str, applications: &[(String, String)]) -> Vec<(String, String)> {
-    applications
-        .iter()
+    applications.iter()
         .filter(|(name, _)| name.to_lowercase().contains(&query.to_lowercase()))
+        .take(5)  // Limit to 5 applications
         .cloned()
         .collect()
 }
@@ -93,7 +101,9 @@ fn launch_app(app_name: &str, exec_cmd: &str) -> Result<(), Box<dyn std::error::
     let mut cache = RECENT_APPS_CACHE.lock().map_err(|e| format!("Lock error: {:?}", e))?;
     cache.recent_apps.retain(|x| x != app_name);
     cache.recent_apps.push_front(app_name.to_string());
-    if cache.recent_apps.len() > 10 { cache.recent_apps.pop_back(); }
+    if cache.recent_apps.len() > 10 {
+        cache.recent_apps.pop_back();
+    }
     save_cache(&RECENT_APPS_FILE, &*cache)?;
 
     let home_dir = dirs::home_dir().ok_or("Failed to find home directory")?;
@@ -115,7 +125,7 @@ struct AppLauncher {
 impl Default for AppLauncher {
     fn default() -> Self {
         let applications: Vec<(String, String)> = get_desktop_entries()
-            .iter()
+            .par_iter()
             .filter_map(|path| parse_desktop_entry(path))
             .collect();
 
@@ -125,7 +135,7 @@ impl Default for AppLauncher {
             query: String::new(),
             search_results: recent_apps_cache.recent_apps.iter().filter_map(|app_name| {
                 applications.iter().find(|(name, _)| name == app_name).cloned()
-            }).collect(),
+            }).take(5).collect(),  // Limit to 5 applications
             applications,
             is_quit: false,
         }
@@ -135,7 +145,7 @@ impl Default for AppLauncher {
 impl eframe::App for AppLauncher {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint();  // Ensure the app continues to repaint while it's running
-        
+
         if self.is_quit {
             std::process::exit(0);  // Exit the process if is_quit is true
         }
@@ -156,38 +166,44 @@ impl eframe::App for AppLauncher {
         });
 
         CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Application Launcher");
-            if ui.add(TextEdit::singleline(&mut self.query).hint_text("Search...")).changed() {
-                self.search_results = search_applications(&self.query, &self.applications);
-            }
+            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                if ui.add(TextEdit::singleline(&mut self.query).hint_text("Search...")).changed() {
+                    self.search_results = search_applications(&self.query, &self.applications);
+                }
 
-            ScrollArea::vertical().show(ui, |ui| {
-                for (app_name, exec_cmd) in &self.search_results {
-                    if ui.button(app_name).clicked() {
-                        if let Err(err) = launch_app(app_name, exec_cmd) {
-                            eprintln!("Failed to launch app: {}", err);
-                        } else {
-                            self.is_quit = true;
+                ScrollArea::vertical().show(ui, |ui| {
+                    for (app_name, exec_cmd) in &self.search_results {
+                        if ui.button(app_name).clicked() {
+                            if let Err(err) = launch_app(app_name, exec_cmd) {
+                                eprintln!("Failed to launch app: {}", err);
+                            } else {
+                                self.is_quit = true;
+                            }
                         }
                     }
-                }
+                });
             });
 
-            ui.separator();
-            
-            let datetime: DateTime<Local> = SystemTime::now().into();
-            ui.label(datetime.format("%I:%M %p %m/%d/%Y").to_string());
+            // Add a filler to push the footer to the bottom
+            ui.add_space(ui.available_height() - 100.0);
 
-            ui.horizontal(|ui| {
-                if ui.button("Power").clicked() {
-                    Command::new("shutdown").arg("-h").arg("now").spawn().expect("Failed to execute shutdown command");
-                }
-                if ui.button("Restart").clicked() {
-                    Command::new("reboot").spawn().expect("Failed to execute reboot command");
-                }
-                if ui.button("Logout").clicked() {
-                    Command::new("logout").spawn().expect("Failed to execute logout command");
-                }
+            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Power").clicked() {
+                        Command::new("shutdown").arg("-h").arg("now").spawn().expect("Failed to execute shutdown command");
+                    }
+                    if ui.button("Restart").clicked() {
+                        Command::new("reboot").spawn().expect("Failed to execute reboot command");
+                    }
+                    if ui.button("Logout").clicked() {
+                        Command::new("logout").spawn().expect("Failed to execute logout command");
+                    }
+                });
+
+                ui.separator();
+
+                let datetime: DateTime<Local> = SystemTime::now().into();
+                ui.label(datetime.format("%I:%M %p %m/%d/%Y").to_string());
             });
         });
 
