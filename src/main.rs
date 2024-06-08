@@ -1,6 +1,7 @@
-use std::{fs, process::Command, sync::Mutex, time::SystemTime};
-use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::{
+    fs, process::Command, sync::Mutex, time::SystemTime,
+    collections::VecDeque, path::PathBuf,
+};
 use xdg::BaseDirectories;
 use chrono::prelude::*;
 use once_cell::sync::Lazy;
@@ -9,7 +10,7 @@ use bincode::{serialize, deserialize};
 use dirs;
 use eframe::egui;
 use eframe::egui::{CentralPanel, Context, ScrollArea, TextEdit, CursorIcon, Layout, Align};
-use rayon::prelude::*;
+use rayon::prelude::*;  // Import rayon prelude
 
 static RECENT_APPS_FILE: Lazy<PathBuf> = Lazy::new(|| PathBuf::from("recent_apps.bin"));
 
@@ -34,23 +35,17 @@ static RECENT_APPS_CACHE: Lazy<Mutex<RecentAppsCache>> = Lazy::new(|| {
     Mutex::new(RecentAppsCache { recent_apps })
 });
 
-fn get_desktop_entries() -> Vec<String> {
+fn get_desktop_entries() -> Vec<PathBuf> {
     let xdg_dirs = BaseDirectories::new().unwrap();
     let data_dirs = xdg_dirs.get_data_dirs();
 
-    data_dirs.par_iter()
+    data_dirs.par_iter()  // Use parallel iterator
         .flat_map(|dir| {
             let desktop_files = dir.join("applications");
             if let Ok(entries) = fs::read_dir(desktop_files) {
                 entries.filter_map(Result::ok)
-                    .filter_map(|entry| {
-                        let path = entry.path();
-                        if path.extension()? == "desktop" {
-                            Some(path.to_string_lossy().to_string())
-                        } else {
-                            None
-                        }
-                    })
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().map(|ext| ext == "desktop").unwrap_or(false))
                     .collect::<Vec<_>>()
             } else {
                 Vec::new()
@@ -59,7 +54,7 @@ fn get_desktop_entries() -> Vec<String> {
         .collect()
 }
 
-fn parse_desktop_entry(path: &str) -> Option<(String, String)> {
+fn parse_desktop_entry(path: &PathBuf) -> Option<(String, String)> {
     let content = fs::read_to_string(path).ok()?;
     let mut name = None;
     let mut exec = None;
@@ -117,17 +112,20 @@ fn launch_app(app_name: &str, exec_cmd: &str) -> Result<(), Box<dyn std::error::
 
 struct AppLauncher {
     query: String,
-    applications: Vec<(String, String)>,
+    applications: Lazy<Vec<(String, String)>>,  // Lazy initialization
     search_results: Vec<(String, String)>,
     is_quit: bool,
+    focus_set: bool,  // New field to track if focus has been set
 }
 
 impl Default for AppLauncher {
     fn default() -> Self {
-        let applications: Vec<(String, String)> = get_desktop_entries()
-            .par_iter()
-            .filter_map(|path| parse_desktop_entry(path))
-            .collect();
+        let applications: Lazy<Vec<(String, String)>> = Lazy::new(|| {
+            get_desktop_entries()
+                .par_iter()  // Use parallel iterator
+                .filter_map(|path| parse_desktop_entry(path))
+                .collect()
+        });
 
         let recent_apps_cache = RECENT_APPS_CACHE.lock().expect("Failed to acquire read lock");
 
@@ -138,6 +136,7 @@ impl Default for AppLauncher {
             }).take(5).collect(),  // Limit to 5 applications
             applications,
             is_quit: false,
+            focus_set: false,  // Initialize as false
         }
     }
 }
@@ -167,7 +166,15 @@ impl eframe::App for AppLauncher {
 
         CentralPanel::default().show(ctx, |ui| {
             ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                if ui.add(TextEdit::singleline(&mut self.query).hint_text("Search...")).changed() {
+                let response = ui.add(TextEdit::singleline(&mut self.query).hint_text("Search..."));
+                
+                // Set focus on the TextEdit when the app starts
+                if !self.focus_set {
+                    response.request_focus();
+                    self.focus_set = true;
+                }
+
+                if response.changed() {
                     self.search_results = search_applications(&self.query, &self.applications);
                 }
 
@@ -223,4 +230,3 @@ fn main() -> eframe::Result<()> {
         Box::new(|_cc| Box::new(AppLauncher::default())),
     )
 }
-
