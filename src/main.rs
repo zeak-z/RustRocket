@@ -10,7 +10,7 @@ use bincode::{serialize, deserialize};
 use dirs;
 use eframe::egui;
 use eframe::egui::{CentralPanel, Context, ScrollArea, TextEdit, CursorIcon, Layout, Align};
-use rayon::prelude::*;  // Import rayon prelude
+use rayon::prelude::*;
 
 static RECENT_APPS_FILE: Lazy<PathBuf> = Lazy::new(|| PathBuf::from("recent_apps.bin"));
 
@@ -26,30 +26,28 @@ fn save_cache<T: Serialize>(file: &PathBuf, cache: &T) -> Result<(), Box<dyn std
 }
 
 static RECENT_APPS_CACHE: Lazy<Mutex<RecentAppsCache>> = Lazy::new(|| {
-    let recent_apps = if RECENT_APPS_FILE.exists() {
+    if RECENT_APPS_FILE.exists() {
         let data = fs::read(&*RECENT_APPS_FILE).expect("Failed to read recent apps file");
-        deserialize(&data).expect("Failed to deserialize recent apps data")
+        let recent_apps: VecDeque<String> = deserialize(&data).expect("Failed to deserialize recent apps data");
+        Mutex::new(RecentAppsCache { recent_apps })
     } else {
-        VecDeque::new()
-    };
-    Mutex::new(RecentAppsCache { recent_apps })
+        Mutex::new(RecentAppsCache { recent_apps: VecDeque::new() })
+    }
 });
 
 fn get_desktop_entries() -> Vec<PathBuf> {
     let xdg_dirs = BaseDirectories::new().unwrap();
     let data_dirs = xdg_dirs.get_data_dirs();
 
-    data_dirs.par_iter()  // Use parallel iterator
+    data_dirs.par_iter()
         .flat_map(|dir| {
             let desktop_files = dir.join("applications");
-            if let Ok(entries) = fs::read_dir(desktop_files) {
-                entries.filter_map(Result::ok)
-                    .map(|entry| entry.path())
-                    .filter(|path| path.extension().map(|ext| ext == "desktop").unwrap_or(false))
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            }
+            fs::read_dir(&desktop_files).ok()
+                .into_iter()
+                .flat_map(|entries| entries.filter_map(Result::ok))
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|ext| Some(ext == "desktop")).unwrap_or(false))
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -86,9 +84,14 @@ fn parse_desktop_entry(path: &PathBuf) -> Option<(String, String)> {
 
 fn search_applications(query: &str, applications: &[(String, String)]) -> Vec<(String, String)> {
     applications.iter()
-        .filter(|(name, _)| name.to_lowercase().contains(&query.to_lowercase()))
-        .take(5)  // Limit to 5 applications
-        .cloned()
+        .filter_map(|(name, exec)| {
+            if name.to_lowercase().contains(&query.to_lowercase()) {
+                Some((name.clone(), exec.clone()))
+            } else {
+                None
+            }
+        })
+        .take(5)
         .collect()
 }
 
@@ -230,3 +233,4 @@ fn main() -> eframe::Result<()> {
         Box::new(|_cc| Box::new(AppLauncher::default())),
     )
 }
+
